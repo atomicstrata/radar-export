@@ -1,0 +1,43 @@
+{
+  "comment": "Cross-sanitizer conformance corpus — the shared source of truth that keeps hooks/shared/sanitize.js (JS, capture-time), crates/radar-redact (Rust, scan/redact), and the surface sanitizer (crates/radar-daemon surface safe_text, display-time) from drifting. Adversarial test data only — non-sensitive by construction. Consumers: hooks/shared/sanitize.test.js, crates/radar-redact tests, crates/radar-daemon surface tests.",
+  "tiers": {
+    "secret_must_trip": "ALL THREE sanitizers must detect these (JS: redactSecrets changes the string; redact: scan() finds; surface: whole field withheld).",
+    "surface_must_trip": "Only the SURFACE sanitizer must withhold these (paths/diffs/stdout/code/entropy are display-contract rules, not capture-time secret redaction).",
+    "must_pass": "ALL sanitizers must leave these unchanged (false-positive controls)."
+  },
+  "secret_must_trip": [
+    "token sk-AbC123xyz789LMN",
+    "key AKIAIOSFODNN7EXAMPLE",
+    "temp key ASIAIOSFODNN7EXAMPLE",
+    "leaked ghp_AbCdEf1234567890GhIjKl9876 in the log",
+    "review token gho_AbCdEf1234567890GhIjKl9876",
+    "ci token glpat-AbCdEf1234567890GhIj",
+    "uses xoxb-1234567890-abcdefghij",
+    "bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vIn0.c2lnbmF0dXJlLXBhcnQtaGVyZQ"
+  ],
+  "surface_must_trip": [
+    "see /Users/someone/project/file.rs",
+    "look in ~/secret/dir",
+    "open C:\\repo\\main.rs",
+    "read /etc/passwd for users",
+    "config at /app/config/db.yml",
+    "config (see /app/config/db.yml) for details",
+    "see ../../secrets/key.pem",
+    "changes:\n+++ b/file\n--- a/file\n@@ -1 +1 @@",
+    "run this:\n```\nrm -rf /\n```",
+    "l1\nl2\nl3\nl4\nl5\nl6",
+    "blob QUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJD"
+  ],
+  "must_pass": [
+    "Use the shared helper.",
+    "see https://example.com/docs/setup for details",
+    "- check the config\n- restart the daemon",
+    "captured at 2026-06-09T10:00:00.000Z by the hook",
+    "guidance g_550e8400-e29b-41d4-a716-446655440000 fired",
+    "advance past run_codex_junior_spec_review first",
+    "v2 -> v3?",
+    "call the /surface/envelopes route",
+    "see crates/radar-daemon/src/dogfood for the heuristic",
+    "decide and/or defer the I/O work"
+  ]
+}

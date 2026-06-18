@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/radar-export", "crates/radar-redact"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"

@@ -1,0 +1,19 @@
+[package]
+name = "radar-export"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Single self-contained executable that exports redacted Claude/Codex agent-session transcripts (scoping + redaction + verbose report + zip) with no python/bash/zip runtime dependency."
+
+[[bin]]
+name = "radar-export"
+path = "src/main.rs"
+
+[dependencies]
+radar-redact = { path = "../radar-redact" }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+chrono = "0.4"
+zip = "2"
+walkdir = "2"

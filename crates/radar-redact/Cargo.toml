@@ -1,0 +1,25 @@
+[package]
+name = "radar-redact"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Atomic Radar shared secret/PII redactor: boundary re-scan used by both the local daemon (defense-in-depth) and the hosted control plane (enforcement boundary)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+regex = "1.11"
+# `redact_json_value` redacts string VALUES inside a parsed JSON document in
+# place, leaving structure intact — the only correct way to scrub a JSONL
+# transcript without breaking its framing.
+#
+# Deliberately NO `preserve_order` feature: Cargo unifies features across the
+# workspace, and the audit hash chain (radar-daemon `canonical_record_payload`)
+# hashes a `serde_json::Value` built with `json!{}`, relying on serde_json's
+# default sorted-key (BTreeMap) ordering for deterministic `record_hash` values.
+# Turning on `preserve_order` here would flip that to insertion order globally
+# and silently break every audit chain. Re-serialized transcript objects come
+# out with sorted keys (values untouched); key order is irrelevant downstream.
+serde_json = "1"

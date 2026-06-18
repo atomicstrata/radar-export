@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# OS junk
+.DS_Store
+
+# Local exports / scratch (the tool writes these wherever you point --output-dir;
+# never commit transcript exports — they contain real session data)
+/data
+radar-agent-session-export-*/
+radar-agent-session-export-*.zip
