@@ -106,6 +106,28 @@ const MIN_IDENTIFIER_WORDS: usize = 2;
 /// mostly non-word pieces and fall well under this.
 const MIN_IDENTIFIER_WORD_COVERAGE: f64 = 0.6;
 
+/// A URL/path must have at least this many tame structural segments (words,
+/// uuids, hashes, digits, short path words) to be exempted as a URL/path. A
+/// slash-bearing base64 blob fragments into opaque mixed-case chunks that are
+/// NOT tame, so it never reaches two and stays redacted; a real URL/path
+/// (`com/services/…`, `org/en-US/docs/…`, `9650/ext/bc/<id>/rpc`) easily clears
+/// it. Deliberately no cap on opaque segments: an ordinary URL may carry several
+/// ids, and a known secret-bearing URL (Slack webhook) is redacted precisely by
+/// [`scan_tokens`] regardless — so exempting the surrounding URL keeps the
+/// redaction surgical (only the secret segment goes, host/ids survive).
+const MIN_URL_PATH_TAME_SEGMENTS: usize = 2;
+
+/// Segments at or below this length are tame structural path words (`ext`, `bc`,
+/// `rpc`, `api`, `v1`, `com`). Kept at 3 so a 4-char base64 chunk (`Zm9v`) is
+/// NOT tame and a slash-split base64 blob stays redacted.
+const SHORT_PATH_SEGMENT_LEN: usize = 3;
+
+/// Length floor for an env-assignment value to be considered secret-shaped by
+/// entropy. Lower than [`MIN_ENTROPY_TOKEN_LEN`] (the standalone floor) because
+/// the secret-ish key corroborates — the env detector's unique role is catching
+/// medium-length opaque values a bare standalone scan would skip.
+const MIN_ENV_SECRET_VALUE_LEN: usize = 16;
+
 /// Replacement text substituted for every redacted secret span.
 const REDACTION_PLACEHOLDER: &str = "<redacted>";
 
@@ -234,6 +256,23 @@ fn standalone_token_pattern() -> &'static Regex {
     })
 }
 
+/// Compile the Slack incoming-webhook detector once, lazily.
+///
+/// `hooks.slack.com/services/T<id>/B<id>/<secret>` — the trailing segment is the
+/// webhook secret (anyone holding the full URL can post to the channel). Capture
+/// group 1 is the secret segment ONLY, so redaction leaves the host + team/bot
+/// ids (workflow context) intact and removes just the credential. This runs in
+/// [`scan_tokens`], so it fires even though the high-entropy URL exemption skips
+/// the same span — the precise detector is the authority for this known-secret
+/// URL shape.
+fn slack_webhook_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/([A-Za-z0-9]{16,})")
+            .expect("static slack webhook pattern must compile")
+    })
+}
+
 /// Shannon entropy of `s` in bits per character over its byte distribution.
 ///
 /// Deterministic: iterates a fixed-size frequency table, never a hash map, so
@@ -305,6 +344,89 @@ fn looks_like_path(s: &str) -> bool {
         || s.starts_with("../")
         || s.starts_with('\\')
         || s.contains(":\\")
+}
+
+/// True if `seg` is a hex-and-dash id (a uuid fragment / worktree id), e.g.
+/// `46c9-8d66-74551c200319`: only hex digits and dashes, at least one hex digit.
+/// A base64 chunk has non-hex letters / mixed case, so it never qualifies.
+fn is_hex_dash_id(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        && seg.bytes().any(|b| b.is_ascii_hexdigit())
+}
+
+/// True if a `/`-separated segment is "tame" — a structural URL/path segment
+/// rather than an opaque secret chunk: a very short path word (`ext`/`bc`/`rpc`),
+/// all-digits, a hex digest, a uuid, a hex-dash id, or a cleanly-structured
+/// word/identifier. Used by [`looks_like_url_path`]. The short-word floor stays
+/// at 3 so a 4-char base64 chunk is NOT tame (keeps base64 blobs redacted).
+fn is_tame_path_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && (seg.len() <= SHORT_PATH_SEGMENT_LEN
+            || seg.bytes().all(|b| b.is_ascii_digit())
+            || is_hex_digest(seg)
+            || is_uuid(seg)
+            || is_hex_dash_id(seg)
+            || is_word_segment(seg)
+            || looks_like_identifier(seg))
+}
+
+/// True if `token` is `key=<id-or-hash>` where the value is a uuid, a hex digest,
+/// or an (optionally `0x`-prefixed) hex run — a non-secret id/hash in a query
+/// param or key=value (`thread_id=<uuid>`, `ref=<sha>`, `datasetId=0x<hex>`).
+///
+/// Safe by construction: pure hex/uuid values are never high-entropy secrets the
+/// detector would otherwise catch (hex maxes at exactly 4.0 bits/char, the
+/// strict-greater gate already spares it), so this only fixes the LABEL on a
+/// mixed letters+hex token — it never exempts an opaque base64 secret after `=`
+/// (those are not all-hex, so the value check fails).
+fn looks_like_keyed_id(token: &str) -> bool {
+    let Some(eq) = token.rfind('=') else {
+        return false;
+    };
+    let (key, val) = (&token[..eq], &token[eq + 1..]);
+    if key.is_empty() || val.is_empty() {
+        return false;
+    }
+    let key_ok = key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    let hex_val = val
+        .strip_prefix("0x")
+        .or_else(|| val.strip_prefix("0X"))
+        .unwrap_or(val);
+    let is_long_hex =
+        hex_val.len() >= HEX_MD5_LEN && hex_val.bytes().all(|b| b.is_ascii_hexdigit());
+    key_ok && (is_uuid(val) || is_hex_digest(hex_val) || is_long_hex)
+}
+
+/// True if `token` is a `+`-joined list of words (`typecheck+build+test`,
+/// `standalone+grouped`) rather than a `+`-bearing base64 blob. Reuses
+/// [`looks_like_identifier`] by treating `+` as a separator (mapping it to `-`);
+/// a base64 blob's chunks are not clean words, so it still fails. A trailing `=`
+/// (base64 padding) is rejected by `looks_like_identifier` itself.
+fn looks_like_word_list(token: &str) -> bool {
+    token.contains('+') && looks_like_identifier(&token.replace('+', "-"))
+}
+
+/// True if `token` is a URL or multi-segment path rather than an opaque blob.
+///
+/// Exempts ordinary URLs/paths whose segments are structural (words/ids/hashes/
+/// short path words) with at most [`MAX_URL_PATH_OPAQUE_SEGMENTS`] opaque
+/// segment, while keeping slash-bearing base64 blobs redacted: any base64 signal
+/// (`+` / trailing `=`) disqualifies outright, and a blob's several opaque chunks
+/// exceed the opaque budget / fall short of [`MIN_URL_PATH_TAME_SEGMENTS`]. A
+/// known secret-bearing URL (Slack webhook) is still redacted precisely by
+/// [`scan_tokens`], independent of this exemption.
+fn looks_like_url_path(token: &str) -> bool {
+    if token.contains('+') || token.ends_with('=') || !token.contains('/') {
+        return false;
+    }
+    let tame = token
+        .split('/')
+        .filter(|s| !s.is_empty() && is_tame_path_segment(s))
+        .count();
+    tame >= MIN_URL_PATH_TAME_SEGMENTS
 }
 
 /// Split a token into segments on `_`/`-` separators and camelCase boundaries
@@ -404,13 +526,63 @@ fn looks_like_identifier(token: &str) -> bool {
         && (word_letters as f64 / total_letters as f64) >= MIN_IDENTIFIER_WORD_COVERAGE
 }
 
+/// Compile the shaped-public-crypto-id detector once, lazily.
+///
+/// Matches ONLY clearly-public, prefix-shaped ids: Avalanche `NodeID-…` and IPFS
+/// CIDs (`baf…` CIDv1 base32, `Qm…` CIDv0 base58). These are public network
+/// addresses, not secrets. A bare base58/base32 blob with NO such prefix is not
+/// matched and stays subject to the high-entropy detector — it could be a
+/// private key. Anchored (`^…$`) full-token match so a prefix appearing inside a
+/// larger opaque secret cannot exempt it.
+fn public_crypto_id_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"^(?:NodeID-[1-9A-HJ-NP-Za-km-z]+|baf[a-z][a-z2-7]{20,}|Qm[1-9A-HJ-NP-Za-km-z]{44})$",
+        )
+        .expect("static public crypto id pattern must compile")
+    })
+}
+
+/// True if `token` is a shaped public crypto id (Avalanche NodeID / IPFS CID).
+fn is_public_crypto_id(token: &str) -> bool {
+    public_crypto_id_pattern().is_match(token)
+}
+
+/// True if `token` is a Subresource-Integrity hash (`sha256-`/`sha384-`/
+/// `sha512-` followed by base64) from an npm/pnpm lockfile. These are public
+/// content hashes, not secrets. Prefix-anchored so only the SRI shape qualifies.
+fn is_sri_hash(token: &str) -> bool {
+    let rest = token
+        .strip_prefix("sha512-")
+        .or_else(|| token.strip_prefix("sha384-"))
+        .or_else(|| token.strip_prefix("sha256-"));
+    match rest {
+        Some(body) => {
+            !body.is_empty()
+                && body
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        }
+        None => false,
+    }
+}
+
 /// True if a standalone token should be exempted from high-entropy redaction.
 ///
 /// Exemptions are the false-positive controls: git SHAs, UUIDs, path-like
 /// strings, and cleanly-structured source identifiers are legitimate dev
 /// artifacts and must never be flagged.
 fn is_entropy_exempt(token: &str) -> bool {
-    is_hex_digest(token) || is_uuid(token) || looks_like_path(token) || looks_like_identifier(token)
+    is_hex_digest(token)
+        || is_uuid(token)
+        || looks_like_path(token)
+        || looks_like_url_path(token)
+        || looks_like_keyed_id(token)
+        || looks_like_word_list(token)
+        || is_public_crypto_id(token)
+        || is_sri_hash(token)
+        || looks_like_identifier(token)
 }
 
 /// Collect prefix-anchored token findings. The pattern consumes an optional
@@ -427,13 +599,50 @@ fn scan_tokens(input: &str, out: &mut Vec<SecretFinding>) {
             });
         }
     }
+    // Slack incoming-webhook URL: redact only the trailing secret segment
+    // (capture group 1), leaving the host + team/bot ids as workflow context.
+    for caps in slack_webhook_pattern().captures_iter(input) {
+        let Some(secret) = caps.get(1) else { continue };
+        out.push(SecretFinding {
+            kind: SecretKind::SlackToken,
+            start: secret.start(),
+            end: secret.end(),
+        });
+    }
 }
 
-/// Collect env-file assignment findings (the value span only).
+/// True if an env-assignment value is itself secret-shaped: a known-prefix
+/// token, or an opaque high-entropy run. Key context corroborates, so the
+/// length floor is lower than the standalone detector's, but all the FP
+/// exemptions still apply. This is the 2026-06-22 retune: a secret-ish KEY name
+/// alone no longer redacts the value — the value must look like a secret — which
+/// removes the dominant code/type/identifier false positives (`token_budget:
+/// number`, `Authorization: Bearer`, `inputTokens: usage.inputTokens`).
+fn env_value_is_secret(value: &str) -> bool {
+    if token_patterns().iter().any(|p| p.regex.is_match(value)) {
+        return true;
+    }
+    // The opaque-value branch requires a SINGLE base64url-charset token. Code
+    // expressions assigned to a secret-ish key (`fixture_key(Profile::X)`,
+    // `process.env.X`, `PrivateKey::from_seed(64_000)`) carry high Shannon
+    // entropy too, so without this charset gate they would be misread as
+    // secrets — the dominant residual env false positive on real transcripts.
+    let is_opaque_token = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    is_opaque_token
+        && value.len() >= MIN_ENV_SECRET_VALUE_LEN
+        && !is_entropy_exempt(value)
+        && shannon_entropy_bits(value) > ENTROPY_BITS_THRESHOLD
+}
+
+/// Collect env-file assignment findings (the value span only), but ONLY when the
+/// value is itself secret-shaped (see [`env_value_is_secret`]).
 fn scan_env(input: &str, out: &mut Vec<SecretFinding>) {
     for caps in env_pattern().captures_iter(input) {
         let Some(value) = caps.get(1) else { continue };
-        if value.as_str().len() < MIN_ENV_VALUE_LEN {
+        if value.as_str().len() < MIN_ENV_VALUE_LEN || !env_value_is_secret(value.as_str()) {
             continue;
         }
         out.push(SecretFinding {
@@ -594,6 +803,22 @@ mod tests {
     }
 
     #[test]
+    fn redacts_slack_webhook_secret_segment() {
+        // Security property: the webhook secret is gone and a SlackToken finding
+        // names it precisely. (Surgical context-preservation — keeping the host +
+        // T/B ids — additionally requires the URL exemption; see
+        // `slack_webhook_context_preserved_with_url_exemption`.)
+        let input =
+            "post to https://hooks.slack.com/services/T00000000000/B00000000000/EXAMPLEdummyWebhookSecret now";
+        assert!(
+            !redact(input).contains("EXAMPLEdummyWebhookSecret"),
+            "webhook secret survived: {}",
+            redact(input)
+        );
+        assert!(scan(input).iter().any(|f| f.kind == SecretKind::SlackToken));
+    }
+
+    #[test]
     fn redacts_gitlab_token() {
         let input = "pat glpat-abcdefghijklmnopqrstuvwx end";
         assert_eq!(redact(input), "pat <redacted> end");
@@ -610,11 +835,59 @@ mod tests {
 
     #[test]
     fn redacts_env_assignment_value_keeps_key() {
-        // Value chosen so ONLY the env scanner catches it (an sk- value would now
-        // match the ApiKey token pattern first — the env path is what's under test).
-        let input = "API_KEY=opaquelivesecret123";
+        // New contract (2026-06-22): the value must be secret-SHAPED. A
+        // high-entropy opaque value (19 chars: above the env floor of 16, below
+        // the standalone floor of 32 so only the key-corroborated env scanner
+        // catches it) is redacted; the key survives.
+        let input = "API_KEY=Xk7Qz9Lm2Wp5Rt8Nv3J";
         assert_eq!(redact(input), "API_KEY=<redacted>");
         assert_eq!(scan(input)[0].kind, SecretKind::EnvAssignment);
+    }
+
+    #[test]
+    fn env_low_entropy_value_is_not_redacted() {
+        // Decision 2026-06-22: env no longer redacts a low-entropy value on key
+        // context alone — that fired on code (`token_budget: number`,
+        // `Authorization: Bearer`). These stay clean.
+        for s in [
+            "DB_PASSWORD=hunter2",
+            "token_budget: number",
+            "Authorization: Bearer",
+            "api_key: local-dev-key",
+            "inputTokens: usage.inputTokens",
+        ] {
+            assert!(
+                is_clean(s),
+                "low-entropy env value wrongly redacted: {s:?} -> {:?}",
+                scan(s)
+            );
+        }
+    }
+
+    #[test]
+    fn env_colon_form_high_entropy_value_redacted() {
+        assert_eq!(
+            redact("password: aG9yc2ViYXR0ZXJ5c3RhcGxl12"),
+            "password: <redacted>"
+        );
+    }
+
+    #[test]
+    fn env_code_expression_value_is_not_redacted() {
+        // Code assigned to a secret-ish key has high Shannon entropy but is NOT a
+        // secret. The value-shape gate requires a single base64url token, so code
+        // punctuation (`(`, `::`, `.`, `;`) disqualifies these.
+        for s in [
+            "let secret = fixture_authority_key(DeploymentProfile::PublicDevnet);",
+            "key = ed25519::PrivateKey::from_seed(64_000);",
+            "const token = process.env.OPENAI_API_KEY",
+        ] {
+            assert!(
+                is_clean(s),
+                "code expression wrongly redacted: {s:?} -> {:?}",
+                scan(s)
+            );
+        }
     }
 
     #[test]
@@ -626,9 +899,13 @@ mod tests {
     }
 
     #[test]
-    fn env_assignment_colon_form_redacts_value() {
-        let input = "password: hunter2supersecret";
-        assert_eq!(redact(input), "password: <redacted>");
+    fn env_known_prefix_value_still_redacted() {
+        // A known-prefix secret as an env value trips regardless of entropy —
+        // via the token detector, which the env value-shape gate also honors.
+        assert_eq!(
+            redact("API_KEY=\"sk-livesecret1234567890\""),
+            "API_KEY=\"<redacted>\""
+        );
     }
 
     #[test]
@@ -995,6 +1272,147 @@ mod tests {
         ] {
             assert!(!is_clean(s), "base64-with-slash leaked: {s:?}");
         }
+    }
+
+    #[test]
+    fn url_path_tokens_are_exempt() {
+        // Real ENTROPY_IDENT false positives from the 2026-06-22 export review:
+        // URLs and multi-segment paths whose segments are structural (words,
+        // uuids, hashes, digits, short path words) with at most one opaque id.
+        for s in [
+            "com/karpathy/442a6bf555914893e9891c11519de94f",
+            "com/gists/442a6bf555914893e9891c11519de94f/comments",
+            "4321/sessions/01a5d8cd-94eb-4d43-b509-58b0ef17992a/events",
+            "9650/ext/bc/2K6Jd2ZX1mAndukLmFC27akGg8AkpVCXYD5F6vmfSA9JjbKimE/rpc",
+            "org/en-US/docs/Web/HTTP/Status/403",
+            "7080/v1/datasets/c58b6937e8d789f3da678eed48aa12a231d8090cacbfad66bbb99073cfda0e1e",
+        ] {
+            assert!(
+                is_clean(s),
+                "url/path wrongly flagged: {s:?} -> {:?}",
+                scan(s)
+            );
+        }
+    }
+
+    #[test]
+    fn base64_with_slash_still_trips_after_url_exemption() {
+        // F1 must hold: slash-bearing base64 blobs are NOT url-paths (base64
+        // signal, or several opaque chunks / too few tame segments).
+        for s in [
+            "aGVsbG8/d29ybGQrc2VjcmV0L2Jheg==",
+            "abQ/cdEFghIJklMNopQRstUVwxYZ0123456789zzz",
+            "Zm9v/YmFy/c2VjcmV0a2V5/MTIzNDU2Nzg5MDEy",
+        ] {
+            assert!(!is_clean(s), "base64-with-slash leaked: {s:?}");
+        }
+    }
+
+    #[test]
+    fn slack_webhook_context_preserved_with_url_exemption() {
+        // With the URL exemption, the high-entropy detector no longer eats the
+        // whole webhook token; only the precise Slack detector fires, so the
+        // host + T/B ids survive and just the secret segment is redacted.
+        let input =
+            "see hooks.slack.com/services/T00000000000/B00000000000/EXAMPLEdummyWebhookSecret ok";
+        let out = redact(input);
+        assert!(
+            !out.contains("EXAMPLEdummyWebhookSecret"),
+            "secret survived: {out}"
+        );
+        assert!(
+            out.contains("hooks.slack.com/services/T00000000000/B00000000000/"),
+            "context lost: {out}"
+        );
+    }
+
+    #[test]
+    fn keyed_id_or_hash_after_equals_is_exempt() {
+        // Residual FP tail (2026-06-22): an id/hash in a `key=value` or query
+        // param — uuid, git sha, 0x-hex — is workflow signal, not a secret.
+        for s in [
+            "thread_id=019e8026-1372-7991-ac37-025d98f62def",
+            "ref=5a807d8e8c4a6f98354d7d7181223accf7412b6d",
+            "datasetId=0xaf943f4f6ba8ea30cbe82e7c4441d8c68f3f6c9fe375fea9",
+        ] {
+            assert!(
+                is_clean(s),
+                "keyed id wrongly flagged: {s:?} -> {:?}",
+                scan(s)
+            );
+        }
+    }
+
+    #[test]
+    fn keyed_opaque_secret_after_equals_still_trips() {
+        // The exemption is only for uuid/hex values — an opaque base64 secret
+        // after `=` must still trip (no leak).
+        assert!(!is_clean("session=aG9yc2ViYXR0ZXJ5c3RhcGxlMTIzNDU2Nzg5MA"));
+    }
+
+    #[test]
+    fn sri_integrity_hash_is_exempt() {
+        // Subresource-integrity hashes from npm/pnpm lockfiles are public.
+        for s in [
+            "sha512-qMlSxKbpRlAridDExk92nSobyDdpPijUq2DW6oDnUqd0iOGxmQjyqhMIih",
+            "sha384-JlCMOehdEIKqlFxk6IfVoAUVmgz7cU7zDh9XZ0qzeosSHmUJVOzSQvvY",
+        ] {
+            assert!(
+                is_clean(s),
+                "SRI hash wrongly flagged: {s:?} -> {:?}",
+                scan(s)
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_hex_dash_id_with_slug_is_exempt() {
+        // `<hex-dash-id>/<word-slug>` worktree dir names are workflow signal.
+        assert!(is_clean("46c9-8d66-74551c200319/buttered-xylocarp"));
+    }
+
+    #[test]
+    fn plus_joined_word_list_is_exempt() {
+        for s in [
+            "typecheck+build+test+fallow+boundary-grep",
+            "standalone+grouped",
+        ] {
+            assert!(
+                is_clean(s),
+                "word list wrongly flagged: {s:?} -> {:?}",
+                scan(s)
+            );
+        }
+    }
+
+    #[test]
+    fn plus_bearing_base64_blob_still_trips() {
+        // Allowing `+`-joined WORD lists must not exempt a `+`-bearing base64 blob.
+        assert!(!is_clean("aGVsbG8+d29ybGQrc2VjcmV0a2V5MTIzNDU2Nzg5"));
+    }
+
+    #[test]
+    fn shaped_public_crypto_ids_are_exempt() {
+        // Decision 2026-06-22: exempt clearly-public, prefix-shaped ids only.
+        for s in [
+            "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg",
+            "bafkzcibcd4bdomn3tgwgrh3g532zopskstnbrd2n3sxfqbze7rxt7vqn7veigmy",
+            "QmYwAPJzv5CZsnaZ3pHsT6tV5urR8aP6kRfd2pY9NPCWHy",
+        ] {
+            assert!(
+                is_clean(s),
+                "public id wrongly flagged: {s:?} -> {:?}",
+                scan(s)
+            );
+        }
+    }
+
+    #[test]
+    fn bare_base58_blob_without_public_prefix_still_trips() {
+        // A bare high-entropy base58 blob could be a private key — NOT exempt.
+        assert!(!is_clean(
+            "5KJvsngHeMpm884wtkpnx5tRunosvjjHu2pX7T46GwL8MeC8oVT"
+        ));
     }
 
     #[test]
