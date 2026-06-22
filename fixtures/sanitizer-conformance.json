@@ -13,7 +13,8 @@
     "review token gho_AbCdEf1234567890GhIjKl9876",
     "ci token glpat-AbCdEf1234567890GhIj",
     "uses xoxb-1234567890-abcdefghij",
-    "bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vIn0.c2lnbmF0dXJlLXBhcnQtaGVyZQ"
+    "bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vIn0.c2lnbmF0dXJlLXBhcnQtaGVyZQ",
+    "slack hook https://hooks.slack.com/services/T00000000000/B00000000000/EXAMPLEdummyWebhookSecret"
   ],
   "surface_must_trip": [
     "see /Users/someone/project/file.rs",
@@ -38,6 +39,18 @@
     "v2 -> v3?",
     "call the /surface/envelopes route",
     "see crates/radar-daemon/src/dogfood for the heuristic",
-    "decide and/or defer the I/O work"
+    "decide and/or defer the I/O work",
+    "see com/karpathy/442a6bf555914893e9891c11519de94f gist",
+    "GET 4321/sessions/01a5d8cd-94eb-4d43-b509-58b0ef17992a/events",
+    "rpc 9650/ext/bc/2K6Jd2ZX1mAndukLmFC27akGg8AkpVCXYD5F6vmfSA9JjbKimE/rpc",
+    "node NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg joined",
+    "cid bafkzcibcd4bdomn3tgwgrh3g532zopskstnbrd2n3sxfqbze7rxt7vqn7veigmy stored",
+    "interface { token_budget: number; inputTokens: number }",
+    "send Authorization: Bearer to the API",
+    "export OPENAI_API_KEY=local-dev-key for tests",
+    "resume thread_id=019e8026-1372-7991-ac37-025d98f62def now",
+    "at ref=5a807d8e8c4a6f98354d7d7181223accf7412b6d landed",
+    "worktree 46c9-8d66-74551c200319/buttered-xylocarp ready",
+    "gate typecheck+build+test+fallow+boundary-grep passed"
   ]
 }
