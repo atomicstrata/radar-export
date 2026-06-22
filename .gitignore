@@ -9,3 +9,6 @@
 /data
 radar-agent-session-export-*/
 radar-agent-session-export-*.zip
+
+# Local scratch (review logs, sample exports — real session data)
+/tmp
